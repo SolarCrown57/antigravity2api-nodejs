@@ -3,18 +3,39 @@ import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { generateAssistantResponse, generateAssistantResponseNoStream, getAvailableModels, generateImageForSD, closeRequester } from '../api/client.js';
-import { generateRequestBody } from '../utils/utils.js';
+import { generateRequestBody, prepareImageRequest } from '../utils/utils.js';
 import logger from '../utils/logger.js';
 import config from '../config/config.js';
 import tokenManager from '../auth/token_manager.js';
 import adminRouter from '../routes/admin.js';
 import sdRouter from '../routes/sd.js';
-import memoryManager, { MemoryPressure } from '../utils/memoryManager.js';
+import memoryManager, { MemoryPressure, registerMemoryPoolCleanup } from '../utils/memoryManager.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+
+// ==================== 通用重试工具（处理 429） ====================
+const with429Retry = async (fn, maxRetries, loggerPrefix = '') => {
+  const retries = Number.isFinite(maxRetries) && maxRetries > 0 ? Math.floor(maxRetries) : 0;
+  let attempt = 0;
+  // 首次执行 + 最多 retries 次重试
+  while (true) {
+    try {
+      return await fn(attempt);
+    } catch (error) {
+      const status = Number(error.status || error.response?.status);
+      if (status === 429 && attempt < retries) {
+        const nextAttempt = attempt + 1;
+        logger.warn(`${loggerPrefix}收到 429，正在进行第 ${nextAttempt} 次重试（共 ${retries} 次）`);
+        attempt = nextAttempt;
+        continue;
+      }
+      throw error;
+    }
+  }
+};
 
 // ==================== 心跳机制（防止 CF 超时） ====================
 const HEARTBEAT_INTERVAL = config.server.heartbeatInterval || 15000; // 从配置读取心跳间隔
@@ -65,14 +86,8 @@ const releaseChunkObject = (obj) => {
   if (chunkPool.length < maxSize) chunkPool.push(obj);
 };
 
-// 注册内存清理回调
-memoryManager.registerCleanup((pressure) => {
-  const poolSizes = memoryManager.getPoolSizes();
-  // 根据压力缩减对象池
-  while (chunkPool.length > poolSizes.chunk) {
-    chunkPool.pop();
-  }
-});
+// 注册内存清理回调（使用统一工具收缩对象池）
+registerMemoryPoolCleanup(chunkPool, () => memoryManager.getPoolSizes().chunk);
 
 // 启动内存管理器
 memoryManager.start(30000);
@@ -92,7 +107,10 @@ const createStreamChunk = (id, created, model, delta, finish_reason = null) => {
 const writeStreamData = (res, data) => {
   const json = JSON.stringify(data);
   // 释放对象回池
-  if (data.choices) releaseChunkObject(data);
+                const delta = { reasoning_content: data.reasoning_content };
+                if (data.thoughtSignature) {
+                  delta.thoughtSignature = data.thoughtSignature;
+                }
   res.write(SSE_PREFIX);
   res.write(json);
   res.write(SSE_SUFFIX);
@@ -100,8 +118,42 @@ const writeStreamData = (res, data) => {
 
 // 工具函数：结束流式响应
 const endStream = (res) => {
+  if (res.writableEnded) return;
   res.write(SSE_DONE);
   res.end();
+};
+
+// OpenAI 兼容错误响应构造
+const buildOpenAIErrorPayload = (error, statusCode) => {
+  if (error.isUpstreamApiError && error.rawBody) {
+    try {
+      const raw = typeof error.rawBody === 'string' ? JSON.parse(error.rawBody) : error.rawBody;
+      const inner = raw.error || raw;
+      return {
+        error: {
+          message: inner.message || error.message || 'Upstream API error',
+          type: inner.type || 'upstream_api_error',
+          code: inner.code ?? statusCode
+        }
+      };
+    } catch {
+      return {
+        error: {
+          message: error.rawBody || error.message || 'Upstream API error',
+          type: 'upstream_api_error',
+          code: statusCode
+        }
+      };
+    }
+  }
+
+  return {
+    error: {
+      message: error.message || 'Internal server error',
+      type: 'server_error',
+      code: statusCode
+    }
+  };
 };
 
 app.use(cors());
@@ -193,68 +245,80 @@ app.post('/v1/chat/completions', async (req, res) => {
     const isImageModel = model.includes('-image');
     const requestBody = generateRequestBody(messages, model, params, tools, token);
     if (isImageModel) {
-      requestBody.request.generationConfig={
-        candidateCount: 1,
-        // imageConfig:{
-        //   aspectRatio: "1:1"
-        // }
-      }
-      requestBody.requestType="image_gen";
-      //requestBody.request.systemInstruction.parts[0].text += "现在你作为绘画模型聚焦于帮助用户生成图片";
-      delete requestBody.request.systemInstruction;
-      delete requestBody.request.tools;
-      delete requestBody.request.toolConfig;
+      prepareImageRequest(requestBody);
     }
     //console.log(JSON.stringify(requestBody,null,2))
     
     const { id, created } = createResponseMeta();
+    const maxRetries = Number(config.retryTimes || 0);
+    const safeRetries = maxRetries > 0 ? Math.floor(maxRetries) : 0;
     
     if (stream) {
       setStreamHeaders(res);
       
       // 启动心跳，防止 Cloudflare 超时断连
       const heartbeatTimer = createHeartbeat(res);
-      
+
       try {
         if (isImageModel) {
-          //console.log(JSON.stringify(requestBody,null,2));
-          const { content, usage } = await generateAssistantResponseNoStream(requestBody, token);
+          const { content, usage } = await with429Retry(
+            () => generateAssistantResponseNoStream(requestBody, token),
+            safeRetries,
+            'chat.stream.image '
+          );
           writeStreamData(res, createStreamChunk(id, created, model, { content }));
           writeStreamData(res, { ...createStreamChunk(id, created, model, {}, 'stop'), usage });
         } else {
           let hasToolCall = false;
           let usageData = null;
-          await generateAssistantResponse(requestBody, token, (data) => {
-            if (data.type === 'usage') {
-              usageData = data.usage;
-            } else if (data.type === 'reasoning') {
-              // DeepSeek 格式：思维链内容通过 reasoning_content 字段输出
-              const delta = { reasoning_content: data.reasoning_content };
-              writeStreamData(res, createStreamChunk(id, created, model, delta));
-            } else if (data.type === 'tool_calls') {
-              hasToolCall = true;
-              const delta = { tool_calls: data.tool_calls };
-              writeStreamData(res, createStreamChunk(id, created, model, delta));
-            } else {
-              const delta = { content: data.content };
-              writeStreamData(res, createStreamChunk(id, created, model, delta));
-            }
-          });
+
+          await with429Retry(
+            () => generateAssistantResponse(requestBody, token, (data) => {
+              if (data.type === 'usage') {
+                usageData = data.usage;
+              } else if (data.type === 'reasoning') {
+                const delta = { reasoning_content: data.reasoning_content };
+                if (data.thoughtSignature) {
+                  delta.thoughtSignature = data.thoughtSignature;
+                }
+                writeStreamData(res, createStreamChunk(id, created, model, delta));
+              } else if (data.type === 'tool_calls') {
+                hasToolCall = true;
+                const toolCallsWithIndex = data.tool_calls.map((toolCall, index) => ({ index, ...toolCall }));
+                const delta = { tool_calls: toolCallsWithIndex };
+                writeStreamData(res, createStreamChunk(id, created, model, delta));
+              } else {
+                const delta = { content: data.content };
+                writeStreamData(res, createStreamChunk(id, created, model, delta));
+              }
+            }),
+            safeRetries,
+            'chat.stream '
+          );
+
           writeStreamData(res, { ...createStreamChunk(id, created, model, {}, hasToolCall ? 'tool_calls' : 'stop'), usage: usageData });
         }
-      } finally {
+
         clearInterval(heartbeatTimer);
         endStream(res);
+      } catch (error) {
+        clearInterval(heartbeatTimer);
+        throw error;
       }
     } else {
       // 非流式请求：设置较长超时，避免大模型响应超时
       req.setTimeout(0); // 禁用请求超时
       res.setTimeout(0); // 禁用响应超时
       
-      const { content, reasoningContent, toolCalls, usage } = await generateAssistantResponseNoStream(requestBody, token);
+      const { content, reasoningContent, reasoningSignature, toolCalls, usage } = await with429Retry(
+        () => generateAssistantResponseNoStream(requestBody, token),
+        safeRetries,
+        'chat.no_stream '
+      );
       // DeepSeek 格式：reasoning_content 在 content 之前
       const message = { role: 'assistant' };
       if (reasoningContent) message.reasoning_content = reasoningContent;
+      if (reasoningSignature) message.thoughtSignature = reasoningSignature;
       message.content = content;
       if (toolCalls.length > 0) message.tool_calls = toolCalls;
       
@@ -276,29 +340,15 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
   } catch (error) {
     logger.error('生成响应失败:', error.message);
-    if (!res.headersSent) {
-      const { id, created } = createResponseMeta();
-      const errorContent = `错误: ${error.message}`;
-      
-      if (stream) {
-        setStreamHeaders(res);
-        writeStreamData(res, createStreamChunk(id, created, model, { content: errorContent }));
-        writeStreamData(res, createStreamChunk(id, created, model, {}, 'stop'));
-        endStream(res);
-      } else {
-        res.json({
-          id,
-          object: 'chat.completion',
-          created,
-          model,
-          choices: [{
-            index: 0,
-            message: { role: 'assistant', content: errorContent },
-            finish_reason: 'stop'
-          }]
-        });
-      }
+    // 如果已经开始写响应，就不再追加错误内容，避免协议冲突
+    if (res.headersSent) {
+      return;
     }
+
+    // OpenAI 兼容错误返回：HTTP 状态码 + { error: { message, type, code } }
+    const statusCode = Number(error.status) || 500;
+    const errorPayload = buildOpenAIErrorPayload(error, statusCode);
+    return res.status(statusCode).json(errorPayload);
   }
 });
 

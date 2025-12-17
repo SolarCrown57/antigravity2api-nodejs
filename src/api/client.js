@@ -5,8 +5,10 @@ import { generateToolCallId } from '../utils/idGenerator.js';
 import AntigravityRequester from '../AntigravityRequester.js';
 import { saveBase64Image } from '../utils/imageStorage.js';
 import logger from '../utils/logger.js';
-import { httpAgent, httpsAgent } from '../utils/utils.js';
-import memoryManager, { MemoryPressure } from '../utils/memoryManager.js';
+import memoryManager, { MemoryPressure, registerMemoryPoolCleanup } from '../utils/memoryManager.js';
+import { buildAxiosRequestConfig } from '../utils/httpClient.js';
+import { setReasoningSignature, setToolSignature } from '../utils/thoughtSignatureCache.js';
+import { getOriginalToolName } from '../utils/toolNameCache.js';
 
 // 请求客户端：优先使用 AntigravityRequester，失败则降级到 axios
 let requester = null;
@@ -136,17 +138,11 @@ const releaseToolCallObject = (obj) => {
 
 // 注册内存清理回调
 function registerMemoryCleanup() {
+  // 使用通用池清理工具，避免重复 while-pop 逻辑
+  registerMemoryPoolCleanup(toolCallPool, () => memoryManager.getPoolSizes().toolCall);
+  registerMemoryPoolCleanup(lineBufferPool, () => memoryManager.getPoolSizes().lineBuffer);
+
   memoryManager.registerCleanup((pressure) => {
-    const poolSizes = memoryManager.getPoolSizes();
-    
-    // 根据压力缩减对象池
-    while (toolCallPool.length > poolSizes.toolCall) {
-      toolCallPool.pop();
-    }
-    while (lineBufferPool.length > poolSizes.lineBuffer) {
-      lineBufferPool.pop();
-    }
-    
     // 高压力或紧急时清理模型缓存
     if (pressure === MemoryPressure.HIGH || pressure === MemoryPressure.CRITICAL) {
       const ttl = getModelCacheTTL();
@@ -183,21 +179,12 @@ function buildHeaders(token) {
 }
 
 function buildAxiosConfig(url, headers, body = null) {
-  const axiosConfig = {
+  return buildAxiosRequestConfig({
     method: 'POST',
     url,
     headers,
-    timeout: config.timeout,
-    // 使用自定义 DNS 解析的 Agent（优先 IPv4，失败则 IPv6）
-    httpAgent,
-    httpsAgent,
-    proxy: config.proxy ? (() => {
-      const proxyUrl = new URL(config.proxy);
-      return { protocol: proxyUrl.protocol.replace(':', ''), host: proxyUrl.hostname, port: parseInt(proxyUrl.port) };
-    })() : false
-  };
-  if (body !== null) axiosConfig.data = body;
-  return axiosConfig;
+    data: body
+  });
 }
 
 function buildRequesterConfig(headers, body = null) {
@@ -209,6 +196,15 @@ function buildRequesterConfig(headers, body = null) {
   };
   if (body !== null) reqConfig.body = JSON.stringify(body);
   return reqConfig;
+}
+
+// 统一构造上游 API 错误对象，方便服务器层识别并透传
+function createApiError(message, status, rawBody) {
+  const err = new Error(message);
+  err.status = status;
+  err.rawBody = rawBody;
+  err.isUpstreamApiError = true;
+  return err;
 }
 
 // 统一错误处理
@@ -230,31 +226,38 @@ async function handleApiError(error, token) {
   
   if (status === 403) {
     if (JSON.stringify(errorBody).includes("The caller does not")){
-      throw new Error(`超出模型最大上下文。错误详情: ${errorBody}`);
+      throw createApiError(`超出模型最大上下文。错误详情: ${errorBody}`, status, errorBody);
     }
     tokenManager.disableCurrentToken(token);
-    throw new Error(`该账号没有使用权限，已自动禁用。错误详情: ${errorBody}`);
+    throw createApiError(`该账号没有使用权限，已自动禁用。错误详情: ${errorBody}`, status, errorBody);
   }
   
-  throw new Error(`API请求失败 (${status}): ${errorBody}`);
+  throw createApiError(`API请求失败 (${status}): ${errorBody}`, status, errorBody);
 }
 
 // 转换 functionCall 为 OpenAI 格式（使用对象池）
-function convertToToolCall(functionCall) {
+// 会尝试将安全工具名还原为原始工具名
+function convertToToolCall(functionCall, sessionId, model) {
   const toolCall = getToolCallObject();
   toolCall.id = functionCall.id || generateToolCallId();
-  toolCall.function.name = functionCall.name;
+  let name = functionCall.name;
+  if (sessionId && model) {
+    const original = getOriginalToolName(sessionId, model, functionCall.name);
+    if (original) name = original;
+  }
+  toolCall.function.name = name;
   toolCall.function.arguments = JSON.stringify(functionCall.args);
   return toolCall;
 }
 
 // 解析并发送流式响应片段（会修改 state 并触发 callback）
 // 支持 DeepSeek 格式：思维链内容通过 reasoning_content 字段输出
+// 同时透传 thoughtSignature，方便客户端后续复用
 function parseAndEmitStreamChunk(line, state, callback) {
-  if (!line.startsWith('data: ')) return;
+  if (!line.startsWith(DATA_PREFIX)) return;
   
   try {
-    const data = JSON.parse(line.slice(6));
+    const data = JSON.parse(line.slice(DATA_PREFIX_LEN));
     //console.log(JSON.stringify(data));
     const parts = data.response?.candidates?.[0]?.content?.parts;
     
@@ -262,13 +265,31 @@ function parseAndEmitStreamChunk(line, state, callback) {
       for (const part of parts) {
         if (part.thought === true) {
           // 思维链内容 - 使用 DeepSeek 格式的 reasoning_content
-          callback({ type: 'reasoning', reasoning_content: part.text || '' });
+          // 缓存最新的签名，方便后续片段缺省时复用，并写入全局缓存
+          if (part.thoughtSignature) {
+            state.reasoningSignature = part.thoughtSignature;
+            if (state.sessionId && state.model) {
+              setReasoningSignature(state.sessionId, state.model, part.thoughtSignature);
+            }
+          }
+          callback({
+            type: 'reasoning',
+            reasoning_content: part.text || '',
+            thoughtSignature: part.thoughtSignature || state.reasoningSignature || null
+          });
         } else if (part.text !== undefined) {
           // 普通文本内容
           callback({ type: 'text', content: part.text });
         } else if (part.functionCall) {
-          // 工具调用
-          state.toolCalls.push(convertToToolCall(part.functionCall));
+          // 工具调用，透传工具签名，并写入全局缓存
+          const toolCall = convertToToolCall(part.functionCall, state.sessionId, state.model);
+          if (part.thoughtSignature) {
+            toolCall.thoughtSignature = part.thoughtSignature;
+            if (state.sessionId && state.model) {
+              setToolSignature(state.sessionId, state.model, part.thoughtSignature);
+            }
+          }
+          state.toolCalls.push(toolCall);
         }
       }
     }
@@ -302,7 +323,13 @@ function parseAndEmitStreamChunk(line, state, callback) {
 export async function generateAssistantResponse(requestBody, token, callback) {
   
   const headers = buildHeaders(token);
-  const state = { toolCalls: [] };
+  // 在 state 中临时缓存思维链签名，供流式多片段复用，并携带 session 与 model 信息以写入全局缓存
+  const state = {
+    toolCalls: [],
+    reasoningSignature: null,
+    sessionId: requestBody.request?.sessionId,
+    model: requestBody.model
+  };
   const lineBuffer = getLineBuffer(); // 从对象池获取
   
   const processChunk = (chunk) => {
@@ -361,12 +388,29 @@ export async function generateAssistantResponse(requestBody, token, callback) {
   }
 }
 
+// 内部工具：从远端拉取完整模型原始数据
+async function fetchRawModels(headers, token) {
+  try {
+    if (useAxios) {
+      const response = await axios(buildAxiosConfig(config.api.modelsUrl, headers, {}));
+      return response.data;
+    }
+    const response = await requester.antigravity_fetch(config.api.modelsUrl, buildRequesterConfig(headers, {}));
+    if (response.status !== 200) {
+      const errorBody = await response.text();
+      throw { status: response.status, message: errorBody };
+    }
+    return await response.json();
+  } catch (error) {
+    await handleApiError(error, token);
+  }
+}
+
 export async function getAvailableModels() {
   // 检查缓存是否有效（动态 TTL）
   const now = Date.now();
   const ttl = getModelCacheTTL();
   if (modelListCache && (now - modelListCacheTime) < ttl) {
-    logger.info(`使用缓存的模型列表 (剩余有效期: ${Math.round((ttl - (now - modelListCacheTime)) / 1000)}秒)`);
     return modelListCache;
   }
   
@@ -378,63 +422,45 @@ export async function getAvailableModels() {
   }
   
   const headers = buildHeaders(token);
+  const data = await fetchRawModels(headers, token);
+  if (!data) {
+    // fetchRawModels 里已经做了统一错误处理，这里兜底为默认列表
+    return getDefaultModelList();
+  }
+
+  const created = Math.floor(Date.now() / 1000);
+  const modelList = Object.keys(data.models || {}).map(id => ({
+    id,
+    object: 'model',
+    created,
+    owned_by: 'google'
+  }));
   
-  try {
-    let data;
-    if (useAxios) {
-      data = (await axios(buildAxiosConfig(config.api.modelsUrl, headers, {}))).data;
-    } else {
-      const response = await requester.antigravity_fetch(config.api.modelsUrl, buildRequesterConfig(headers, {}));
-      if (response.status !== 200) {
-        const errorBody = await response.text();
-        throw { status: response.status, message: errorBody };
-      }
-      data = await response.json();
-    }
-    //console.log(JSON.stringify(data,null,2));
-    const created = Math.floor(Date.now() / 1000);
-    const modelList = Object.keys(data.models || {}).map(id => ({
-        id,
+  // 添加默认模型（如果 API 返回的列表中没有）
+  const existingIds = new Set(modelList.map(m => m.id));
+  for (const defaultModel of DEFAULT_MODELS) {
+    if (!existingIds.has(defaultModel)) {
+      modelList.push({
+        id: defaultModel,
         object: 'model',
         created,
         owned_by: 'google'
-      }));
-    
-    // 添加默认模型（如果 API 返回的列表中没有）
-    const existingIds = new Set(modelList.map(m => m.id));
-    for (const defaultModel of DEFAULT_MODELS) {
-      if (!existingIds.has(defaultModel)) {
-        modelList.push({
-          id: defaultModel,
-          object: 'model',
-          created,
-          owned_by: 'google'
-        });
-      }
+      });
     }
-    
-    const result = {
-      object: 'list',
-      data: modelList
-    };
-    
-    // 更新缓存
-    modelListCache = result;
-    modelListCacheTime = now;
-    const currentTTL = getModelCacheTTL();
-    logger.info(`模型列表已缓存 (有效期: ${currentTTL / 1000}秒, 模型数量: ${modelList.length})`);
-    
-    return result;
-  } catch (error) {
-    // 如果请求失败但有缓存，返回过期的缓存
-    if (modelListCache) {
-      logger.warn(`获取模型列表失败，使用过期缓存: ${error.message}`);
-      return modelListCache;
-    }
-    // 没有缓存时返回默认模型列表
-    logger.warn(`获取模型列表失败，返回默认模型列表: ${error.message}`);
-    return getDefaultModelList();
   }
+  
+  const result = {
+    object: 'list',
+    data: modelList
+  };
+  
+  // 更新缓存
+  modelListCache = result;
+  modelListCacheTime = now;
+  const currentTTL = getModelCacheTTL();
+  logger.info(`模型列表已缓存 (有效期: ${currentTTL / 1000}秒, 模型数量: ${modelList.length})`);
+  
+  return result;
 }
 
 // 清除模型列表缓存（可用于手动刷新）
@@ -446,34 +472,20 @@ export function clearModelListCache() {
 
 export async function getModelsWithQuotas(token) {
   const headers = buildHeaders(token);
-  
-  try {
-    let data;
-    if (useAxios) {
-      data = (await axios(buildAxiosConfig(config.api.modelsUrl, headers, {}))).data;
-    } else {
-      const response = await requester.antigravity_fetch(config.api.modelsUrl, buildRequesterConfig(headers, {}));
-      if (response.status !== 200) {
-        const errorBody = await response.text();
-        throw { status: response.status, message: errorBody };
-      }
-      data = await response.json();
+  const data = await fetchRawModels(headers, token);
+  if (!data) return {};
+
+  const quotas = {};
+  Object.entries(data.models || {}).forEach(([modelId, modelData]) => {
+    if (modelData.quotaInfo) {
+      quotas[modelId] = {
+        r: modelData.quotaInfo.remainingFraction,
+        t: modelData.quotaInfo.resetTime
+      };
     }
-    
-    const quotas = {};
-    Object.entries(data.models || {}).forEach(([modelId, modelData]) => {
-      if (modelData.quotaInfo) {
-        quotas[modelId] = {
-          r: modelData.quotaInfo.remainingFraction,
-          t: modelData.quotaInfo.resetTime
-        };
-      }
-    });
-    
-    return quotas;
-  } catch (error) {
-    await handleApiError(error, token);
-  }
+  });
+  
+  return quotas;
 }
 
 export async function generateAssistantResponseNoStream(requestBody, token) {
@@ -500,6 +512,7 @@ export async function generateAssistantResponseNoStream(requestBody, token) {
   const parts = data.response?.candidates?.[0]?.content?.parts || [];
   let content = '';
   let reasoningContent = '';
+  let reasoningSignature = null;
   const toolCalls = [];
   const imageUrls = [];
   
@@ -507,10 +520,17 @@ export async function generateAssistantResponseNoStream(requestBody, token) {
     if (part.thought === true) {
       // 思维链内容 - 使用 DeepSeek 格式的 reasoning_content
       reasoningContent += part.text || '';
+      if (part.thoughtSignature && !reasoningSignature) {
+        reasoningSignature = part.thoughtSignature;
+      }
     } else if (part.text !== undefined) {
       content += part.text;
     } else if (part.functionCall) {
-      toolCalls.push(convertToToolCall(part.functionCall));
+      const toolCall = convertToToolCall(part.functionCall, requestBody.request?.sessionId, requestBody.model);
+      if (part.thoughtSignature) {
+        toolCall.thoughtSignature = part.thoughtSignature;
+      }
+      toolCalls.push(toolCall);
     } else if (part.inlineData) {
       // 保存图片到本地并获取 URL
       const imageUrl = saveBase64Image(part.inlineData.data, part.inlineData.mimeType);
@@ -526,14 +546,28 @@ export async function generateAssistantResponseNoStream(requestBody, token) {
     total_tokens: usage.totalTokenCount || 0
   } : null;
   
+  // 将新的签名写入全局缓存（按 sessionId + model），供后续请求兜底使用
+  const sessionId = requestBody.request?.sessionId;
+  const model = requestBody.model;
+  if (sessionId && model) {
+    if (reasoningSignature) {
+      setReasoningSignature(sessionId, model, reasoningSignature);
+    }
+    // 工具签名：取第一个带 thoughtSignature 的工具作为缓存源
+    const toolSig = toolCalls.find(tc => tc.thoughtSignature)?.thoughtSignature;
+    if (toolSig) {
+      setToolSignature(sessionId, model, toolSig);
+    }
+  }
+
   // 生图模型：转换为 markdown 格式
   if (imageUrls.length > 0) {
     let markdown = content ? content + '\n\n' : '';
     markdown += imageUrls.map(url => `![image](${url})`).join('\n\n');
-    return { content: markdown, reasoningContent: reasoningContent || null, toolCalls, usage: usageData };
+    return { content: markdown, reasoningContent: reasoningContent || null, reasoningSignature, toolCalls, usage: usageData };
   }
   
-  return { content, reasoningContent: reasoningContent || null, toolCalls, usage: usageData };
+  return { content, reasoningContent: reasoningContent || null, reasoningSignature, toolCalls, usage: usageData };
 }
 
 export async function generateImageForSD(requestBody, token) {

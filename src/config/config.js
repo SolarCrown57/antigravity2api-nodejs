@@ -28,7 +28,7 @@ if (fs.existsSync(configJsonPath)) {
 dotenv.config();
 
 // 获取代理配置：优先使用 PROXY，其次使用系统代理环境变量
-function getProxyConfig() {
+export function getProxyConfig() {
   // 优先使用显式配置的 PROXY
   if (process.env.PROXY) {
     return process.env.PROXY;
@@ -77,7 +77,7 @@ const config = {
     top_p: jsonConfig.defaults?.topP || 0.85,
     top_k: jsonConfig.defaults?.topK || 50,
     max_tokens: jsonConfig.defaults?.maxTokens || 32000,
-    thinking_budget: jsonConfig.defaults?.thinkingBudget || 16000
+    thinking_budget: jsonConfig.defaults?.thinkingBudget ?? 1024
   },
   security: {
     maxRequestSize: jsonConfig.server?.maxRequestSize || '50mb',
@@ -90,6 +90,8 @@ const config = {
   },
   useNativeAxios: jsonConfig.other?.useNativeAxios !== false,
   timeout: jsonConfig.other?.timeout || 300000,
+  // 默认 429 重试次数（统一配置，0 表示不重试，默认 3 次）
+  retryTimes: Number.isFinite(jsonConfig.other?.retryTimes) ? jsonConfig.other.retryTimes : 3,
   proxy: getProxyConfig(),
   systemInstruction: process.env.SYSTEM_INSTRUCTION || '',
   skipProjectIdFetch: jsonConfig.other?.skipProjectIdFetch === true
