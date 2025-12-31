@@ -42,15 +42,13 @@ export const createClaudeResponse = (id, model, content, reasoning, reasoningSig
   const contentBlocks = [];
   
   // 思维链内容（如果有）- Claude 格式用 thinking 类型
+  // 注意：Claude Code 期望 thinking 块始终包含 signature 字段
   if (reasoning) {
-    const thinkingBlock = {
+    contentBlocks.push({
       type: "thinking",
-      thinking: reasoning
-    };
-    if (reasoningSignature && config.passSignatureToClient) {
-      thinkingBlock.signature = reasoningSignature;
-    }
-    contentBlocks.push(thinkingBlock);
+      thinking: reasoning,
+      signature: reasoningSignature || ''
+    });
   }
   
   // 文本内容
@@ -206,29 +204,30 @@ export const handleClaudeRequest = async (req, res, isStream) => {
               usageData = data.usage;
             } else if (data.type === 'reasoning') {
               // 思维链内容 - 使用 thinking 类型
+              // 注意：Claude Code 期望 thinking 块始终包含 signature 字段
               if (!reasoningSent) {
-                // 开始思维块
-                const contentBlock = { type: "thinking", thinking: "" };
-                if (data.thoughtSignature && config.passSignatureToClient) {
-                  contentBlock.signature = data.thoughtSignature;
-                }
+                // 开始思维块 - 始终包含 signature 字段
                 res.write(createClaudeStreamEvent('content_block_start', {
                   type: "content_block_start",
                   index: contentIndex,
-                  content_block: contentBlock
+                  content_block: {
+                    type: "thinking",
+                    thinking: "",
+                    signature: data.thoughtSignature || ''
+                  }
                 }));
                 currentBlockType = 'thinking';
                 reasoningSent = true;
               }
-              // 发送思维增量
-              const delta = { type: "thinking_delta", thinking: data.reasoning_content || '' };
-              if (data.thoughtSignature && config.passSignatureToClient) {
-                delta.signature = data.thoughtSignature;
-              }
+              // 发送思维增量 - 始终包含 signature 字段
               res.write(createClaudeStreamEvent('content_block_delta', {
                 type: "content_block_delta",
                 index: contentIndex,
-                delta: delta
+                delta: {
+                  type: "thinking_delta",
+                  thinking: data.reasoning_content || '',
+                  signature: data.thoughtSignature || ''
+                }
               }));
             } else if (data.type === 'tool_calls') {
               hasToolCall = true;
