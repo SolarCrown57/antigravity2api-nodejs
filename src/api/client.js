@@ -14,7 +14,7 @@ import {
   convertToToolCall,
   registerStreamMemoryCleanup
 } from './stream_parser.js';
-import { setReasoningSignature, setToolSignature } from '../utils/thoughtSignatureCache.js';
+import { cacheSignature } from '../utils/format/signature-cache.js';
 
 // 请求客户端：优先使用 AntigravityRequester，失败则降级到 axios
 let requester = null;
@@ -403,17 +403,10 @@ export async function generateAssistantResponseNoStream(requestBody, token) {
     total_tokens: usage.totalTokenCount || 0
   } : null;
   
-  // 将新的签名写入全局缓存（按 sessionId + model），供后续请求兜底使用
-  const sessionId = requestBody.request?.sessionId;
-  const model = requestBody.model;
-  if (sessionId && model) {
-    if (reasoningSignature) {
-      setReasoningSignature(sessionId, model, reasoningSignature);
-    }
-    // 工具签名：取第一个带 thoughtSignature 的工具作为缓存源
-    const toolSig = toolCalls.find(tc => tc.thoughtSignature)?.thoughtSignature;
-    if (toolSig) {
-      setToolSignature(sessionId, model, toolSig);
+  // 将工具签名写入缓存（按 toolUseId 缓存，与 antigravity-claude-proxy 一致）
+  for (const toolCall of toolCalls) {
+    if (toolCall.thoughtSignature) {
+      cacheSignature(toolCall.id, toolCall.thoughtSignature);
     }
   }
 

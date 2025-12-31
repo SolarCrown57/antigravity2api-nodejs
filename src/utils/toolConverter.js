@@ -1,5 +1,6 @@
 // 工具转换公共模块
-import { sanitizeToolName, cleanParameters } from './utils.js';
+import { sanitizeToolName } from './utils.js';
+import { sanitizeSchema } from './format/schema-sanitizer.js';
 import { setToolNameMapping } from './toolNameCache.js';
 
 /**
@@ -20,7 +21,7 @@ function convertSingleTool(name, description, parameters, sessionId, actualModel
   }
   
   const rawParams = parameters || {};
-  const cleanedParams = cleanParameters(rawParams) || {};
+  const cleanedParams = sanitizeSchema(rawParams) || {};
   if (cleanedParams.type === undefined) cleanedParams.type = 'object';
   if (cleanedParams.type === 'object' && cleanedParams.properties === undefined) cleanedParams.properties = {};
   
