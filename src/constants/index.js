@@ -162,6 +162,33 @@ export const DEFAULT_STOP_SEQUENCES = [
   '<|end_of_turn|>'
 ];
 
+// ==================== 思维链和签名相关常量 ====================
+
+/**
+ * 最小有效签名长度
+ * @type {number}
+ */
+export const MIN_SIGNATURE_LENGTH = 50;
+
+/**
+ * Gemini 签名缓存 TTL（毫秒）- 2小时
+ * @type {number}
+ */
+export const GEMINI_SIGNATURE_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * Gemini 跳过签名验证的哨兵值
+ * 当 Claude Code 剥离 thoughtSignature 字段时使用
+ * @type {string}
+ */
+export const GEMINI_SKIP_SIGNATURE = 'skip_thought_signature_validator';
+
+/**
+ * Gemini 最大输出 token 数
+ * @type {number}
+ */
+export const GEMINI_MAX_OUTPUT_TOKENS = 16384;
+
 // ==================== 管理员默认配置 ====================
 
 // 注意：管理员凭据（用户名、密码、JWT密钥）现在由 config.js 自动生成随机值

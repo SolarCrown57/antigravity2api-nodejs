@@ -1,25 +1,8 @@
 // 转换器公共模块
 import config from '../../config/config.js';
 import { generateRequestId } from '../idGenerator.js';
-import { getReasoningSignature, getToolSignature } from '../thoughtSignatureCache.js';
 import { setToolNameMapping } from '../toolNameCache.js';
-import { getThoughtSignatureForModel, getToolSignatureForModel, sanitizeToolName, modelMapping, isEnableThinking, generateGenerationConfig } from '../utils.js';
-
-/**
- * 获取签名上下文
- * @param {string} sessionId - 会话 ID
- * @param {string} actualModelName - 实际模型名称
- * @returns {Object} 包含思维签名和工具签名的对象
- */
-export function getSignatureContext(sessionId, actualModelName) {
-  const cachedReasoningSig = getReasoningSignature(sessionId, actualModelName);
-  const cachedToolSig = getToolSignature(sessionId, actualModelName);
-
-  return {
-    reasoningSignature: cachedReasoningSig || getThoughtSignatureForModel(actualModelName),
-    toolSignature: cachedToolSig || getToolSignatureForModel(actualModelName)
-  };
-}
+import { sanitizeToolName, modelMapping, isEnableThinking, generateGenerationConfig } from '../utils.js';
 
 /**
  * 添加用户消息到 antigravityMessages

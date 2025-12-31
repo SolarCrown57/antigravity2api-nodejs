@@ -1,7 +1,8 @@
 import memoryManager, { registerMemoryPoolCleanup } from '../utils/memoryManager.js';
 import { generateToolCallId } from '../utils/idGenerator.js';
-import { setReasoningSignature, setToolSignature } from '../utils/thoughtSignatureCache.js';
+import { cacheSignature } from '../utils/format/signature-cache.js';
 import { getOriginalToolName } from '../utils/toolNameCache.js';
+import { MIN_SIGNATURE_LENGTH } from '../constants/index.js';
 
 // 预编译的常量（避免重复创建字符串）
 const DATA_PREFIX = 'data: ';
@@ -87,23 +88,20 @@ function convertToToolCall(functionCall, sessionId, model) {
 
 // 解析并发送流式响应片段（会修改 state 并触发 callback）
 // 支持 DeepSeek 格式：思维链内容通过 reasoning_content 字段输出
-// 同时透传 thoughtSignature，方便客户端后续复用
+// 使用新的签名缓存逻辑（按 toolUseId 缓存）
 function parseAndEmitStreamChunk(line, state, callback) {
   if (!line.startsWith(DATA_PREFIX)) return;
-  
+
   try {
     const data = JSON.parse(line.slice(DATA_PREFIX_LEN));
     const parts = data.response?.candidates?.[0]?.content?.parts;
-    
+
     if (parts) {
       for (const part of parts) {
         if (part.thought === true) {
-          if (part.thoughtSignature) {
+          // 思维块处理
+          if (part.thoughtSignature && part.thoughtSignature.length >= MIN_SIGNATURE_LENGTH) {
             state.reasoningSignature = part.thoughtSignature;
-            if (state.sessionId && state.model) {
-              //console.log("服务器传入的签名："+state.reasoningSignature);
-              setReasoningSignature(state.sessionId, state.model, part.thoughtSignature);
-            }
           }
           callback({
             type: 'reasoning',
@@ -114,17 +112,19 @@ function parseAndEmitStreamChunk(line, state, callback) {
           callback({ type: 'text', content: part.text });
         } else if (part.functionCall) {
           const toolCall = convertToToolCall(part.functionCall, state.sessionId, state.model);
-          if (part.thoughtSignature) {
+
+          // 缓存工具调用的签名（按 toolUseId 缓存，与 antigravity-claude-proxy 一致）
+          if (part.thoughtSignature && part.thoughtSignature.length >= MIN_SIGNATURE_LENGTH) {
             toolCall.thoughtSignature = part.thoughtSignature;
-            if (state.sessionId && state.model) {
-              setToolSignature(state.sessionId, state.model, part.thoughtSignature);
-            }
+            // 使用工具调用 ID 作为缓存键
+            cacheSignature(toolCall.id, part.thoughtSignature);
           }
+
           state.toolCalls.push(toolCall);
         }
       }
     }
-    
+
     if (data.response?.candidates?.[0]?.finishReason) {
       if (state.toolCalls.length > 0) {
         callback({ type: 'tool_calls', tool_calls: state.toolCalls });
