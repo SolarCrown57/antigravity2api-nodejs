@@ -136,7 +136,6 @@ export function generateClaudeRequestBody(claudeMessages, modelName, parameters,
 
     if (mergedSystem) {
         googleRequest.systemInstruction = {
-            role: 'user',
             parts: [{ text: mergedSystem }]
         };
     }
@@ -145,7 +144,7 @@ export function generateClaudeRequestBody(claudeMessages, modelName, parameters,
     if (isClaudeModel && isThinking && claudeTools && claudeTools.length > 0) {
         const hint = 'Interleaved thinking is enabled. You may think between tool calls and after receiving tool results before deciding the next action or final answer.';
         if (!googleRequest.systemInstruction) {
-            googleRequest.systemInstruction = { role: 'user', parts: [{ text: hint }] };
+            googleRequest.systemInstruction = { parts: [{ text: hint }] };
         } else {
             const lastPart = googleRequest.systemInstruction.parts[googleRequest.systemInstruction.parts.length - 1];
             if (lastPart && lastPart.text) {

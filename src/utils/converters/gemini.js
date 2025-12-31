@@ -155,7 +155,6 @@ export function generateGeminiRequestBody(geminiBody, modelName, token) {
   const existingText = request.systemInstruction?.parts?.[0]?.text || '';
   const mergedText = existingText ? `${config.systemInstruction}\n\n${existingText}` : config.systemInstruction ?? "";
   request.systemInstruction = {
-    role: 'user',
     parts: [{ text: mergedText }]
   };
   
