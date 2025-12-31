@@ -134,21 +134,31 @@ function buildRequesterConfig(headers, body = null) {
 
 // 统一错误处理
 async function handleApiError(error, token) {
+  // Normalize status code from various error formats
   const status = error.response?.status || error.status || error.statusCode || 500;
-  let errorBody = error.message;
-  
-  if (error.response?.data?.readable) {
-    const chunks = [];
-    for await (const chunk of error.response.data) {
-      chunks.push(chunk);
+  let errorBody = error.message || 'Unknown error';
+
+  try {
+    // Handle stream response errors
+    if (error.response?.data?.readable) {
+      const chunks = [];
+      for await (const chunk of error.response.data) {
+        chunks.push(chunk);
+      }
+      errorBody = Buffer.concat(chunks).toString();
+    } else if (typeof error.response?.data === 'object') {
+      errorBody = JSON.stringify(error.response.data, null, 2);
+    } else if (error.response?.data) {
+      errorBody = String(error.response.data);
+    } else if (error.body) {
+      // Handle errors with body property (from custom error objects)
+      errorBody = typeof error.body === 'object' ? JSON.stringify(error.body) : String(error.body);
     }
-    errorBody = Buffer.concat(chunks).toString();
-  } else if (typeof error.response?.data === 'object') {
-    errorBody = JSON.stringify(error.response.data, null, 2);
-  } else if (error.response?.data) {
-    errorBody = error.response.data;
+  } catch (parseError) {
+    // If we can't parse the error body, use what we have
+    errorBody = error.message || 'Failed to parse error response';
   }
-  
+
   if (status === 403) {
     if (JSON.stringify(errorBody).includes("The caller does not")){
       throw createApiError(`超出模型最大上下文。错误详情: ${errorBody}`, status, errorBody);
@@ -156,7 +166,7 @@ async function handleApiError(error, token) {
     tokenManager.disableCurrentToken(token);
     throw createApiError(`该账号没有使用权限，已自动禁用。错误详情: ${errorBody}`, status, errorBody);
   }
-  
+
   throw createApiError(`API请求失败 (${status}): ${errorBody}`, status, errorBody);
 }
 
@@ -190,23 +200,38 @@ export async function generateAssistantResponse(requestBody, token, callback) {
         headers,
         data: requestBody
       });
-      
+
+      // Track if we encountered an error during streaming
+      let streamError = null;
+
       // 使用 Buffer 直接处理，避免 toString 的内存分配
       response.data.on('data', chunk => {
-        processChunk(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
+        try {
+          processChunk(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
+        } catch (err) {
+          streamError = err;
+        }
       });
-      
+
       await new Promise((resolve, reject) => {
         response.data.on('end', () => {
           releaseLineBuffer(lineBuffer); // 归还到对象池
-          resolve();
+          if (streamError) {
+            reject(streamError);
+          } else {
+            resolve();
+          }
         });
-        response.data.on('error', reject);
+        response.data.on('error', (err) => {
+          releaseLineBuffer(lineBuffer);
+          reject(err);
+        });
       });
     } else {
       const streamResponse = requester.antigravity_fetchStream(config.api.url, buildRequesterConfig(headers, requestBody));
       let errorBody = '';
       let statusCode = null;
+      let streamError = null;
 
       await new Promise((resolve, reject) => {
         streamResponse
@@ -215,22 +240,31 @@ export async function generateAssistantResponse(requestBody, token, callback) {
             if (statusCode !== 200) {
               errorBody += chunk;
             } else {
-              processChunk(chunk);
+              try {
+                processChunk(chunk);
+              } catch (err) {
+                streamError = err;
+              }
             }
           })
           .onEnd(() => {
             releaseLineBuffer(lineBuffer); // 归还到对象池
-            if (statusCode !== 200) {
+            if (streamError) {
+              reject(streamError);
+            } else if (statusCode !== 200) {
               reject({ status: statusCode, message: errorBody });
             } else {
               resolve();
             }
           })
-          .onError(reject);
+          .onError((err) => {
+            releaseLineBuffer(lineBuffer);
+            reject(err);
+          });
       });
     }
   } catch (error) {
-    releaseLineBuffer(lineBuffer); // 确保归还
+    // lineBuffer may already be released in error handlers above
     await handleApiError(error, token);
   }
 }

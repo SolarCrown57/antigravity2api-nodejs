@@ -69,29 +69,67 @@ app.use((req, res, next) => {
 app.use('/sdapi/v1', sdRouter);
 
 // ==================== API Key 验证中间件 ====================
-app.use((req, res, next) => {
+/**
+ * Unified API key validation middleware
+ * Handles both /v1/ (OpenAI/Claude style) and /v1beta/ (Gemini style) endpoints
+ */
+const validateApiKey = (req, res, next) => {
+  const apiKey = config.security?.apiKey;
+
+  // Skip validation if no API key is configured
+  if (!apiKey) {
+    return next();
+  }
+
+  let providedKey = null;
+  let keySource = null;
+
   if (req.path.startsWith('/v1/')) {
-    const apiKey = config.security?.apiKey;
-    if (apiKey) {
-      const authHeader = req.headers.authorization || req.headers['x-api-key'];
-      const providedKey = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
-      if (providedKey !== apiKey) {
-        logger.warn(`API Key 验证失败: ${req.method} ${req.path} (提供的Key: ${providedKey ? providedKey.substring(0, 10) + '...' : '无'})`);
-        return res.status(401).json({ error: 'Invalid API Key' });
-      }
+    // OpenAI/Claude style: Authorization header or x-api-key header
+    const authHeader = req.headers.authorization;
+    const xApiKey = req.headers['x-api-key'];
+
+    if (authHeader) {
+      providedKey = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
+      keySource = 'Authorization header';
+    } else if (xApiKey) {
+      providedKey = xApiKey;
+      keySource = 'x-api-key header';
     }
   } else if (req.path.startsWith('/v1beta/')) {
-    const apiKey = config.security?.apiKey;
-    if (apiKey) {
-      const providedKey = req.query.key || req.headers['x-goog-api-key'];
-      if (providedKey !== apiKey) {
-        logger.warn(`API Key 验证失败: ${req.method} ${req.path} (提供的Key: ${providedKey ? providedKey.substring(0, 10) + '...' : '无'})`);
-        return res.status(401).json({ error: 'Invalid API Key' });
-      }
+    // Gemini style: query param 'key' or x-goog-api-key header
+    const queryKey = req.query.key;
+    const googApiKey = req.headers['x-goog-api-key'];
+
+    if (queryKey) {
+      providedKey = queryKey;
+      keySource = 'query param';
+    } else if (googApiKey) {
+      providedKey = googApiKey;
+      keySource = 'x-goog-api-key header';
     }
+  } else {
+    // Not an API endpoint that requires validation
+    return next();
   }
+
+  // Validate the key
+  if (providedKey !== apiKey) {
+    const keyPreview = providedKey ? providedKey.substring(0, 10) + '...' : '无';
+    logger.warn(`API Key 验证失败: ${req.method} ${req.path} (来源: ${keySource || 'unknown'}, 提供的Key: ${keyPreview})`);
+    return res.status(401).json({
+      error: {
+        message: 'Invalid API Key',
+        type: 'authentication_error',
+        code: 'invalid_api_key'
+      }
+    });
+  }
+
   next();
-});
+};
+
+app.use(validateApiKey);
 
 // ==================== API 路由 ====================
 

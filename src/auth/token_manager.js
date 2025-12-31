@@ -253,31 +253,49 @@ class TokenManager {
       refresh_token: token.refresh_token
     });
 
-    try {
-      const response = await axios(buildAxiosRequestConfig({
-        method: 'POST',
-        url: OAUTH_CONFIG.TOKEN_URL,
-        headers: {
-          'Host': 'oauth2.googleapis.com',
-          'User-Agent': 'Go-http-client/1.1',
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Accept-Encoding': 'gzip'
-        },
-        data: body.toString()
-      }));
+    const maxRetries = 3;
+    let lastError = null;
 
-      token.access_token = response.data.access_token;
-      token.expires_in = response.data.expires_in;
-      token.timestamp = Date.now();
-      this.saveToFile(token);
-      return token;
-    } catch (error) {
-      const statusCode = error.response?.status;
-      const rawBody = error.response?.data;
-      const suffix = token.access_token ? token.access_token.slice(-8) : null;
-      const message = typeof rawBody === 'string' ? rawBody : (rawBody?.error?.message || error.message || '刷新 token 失败');
-      throw new TokenError(message, suffix, statusCode || 500);
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const response = await axios(buildAxiosRequestConfig({
+          method: 'POST',
+          url: OAUTH_CONFIG.TOKEN_URL,
+          headers: {
+            'Host': 'oauth2.googleapis.com',
+            'User-Agent': 'Go-http-client/1.1',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept-Encoding': 'gzip'
+          },
+          data: body.toString()
+        }));
+
+        token.access_token = response.data.access_token;
+        token.expires_in = response.data.expires_in;
+        token.timestamp = Date.now();
+        this.saveToFile(token);
+        return token;
+      } catch (error) {
+        const statusCode = error.response?.status;
+        const rawBody = error.response?.data;
+        const suffix = token.access_token ? token.access_token.slice(-8) : null;
+        const message = typeof rawBody === 'string' ? rawBody : (rawBody?.error?.message || error.message || '刷新 token 失败');
+
+        // Handle rate limiting (429) with retry
+        if (statusCode === 429 && attempt < maxRetries) {
+          const retryAfter = parseInt(error.response?.headers?.['retry-after']) || (attempt * 2);
+          log.warn(`...${suffix}: 刷新 token 被限流，${retryAfter}秒后重试 (${attempt}/${maxRetries})`);
+          await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+          lastError = new TokenError(message, suffix, statusCode);
+          continue;
+        }
+
+        throw new TokenError(message, suffix, statusCode || 500);
+      }
     }
+
+    // All retries failed
+    throw lastError;
   }
 
   saveToFile(tokenToUpdate = null) {
@@ -395,15 +413,37 @@ class TokenManager {
    * 处理 token 准备过程中的错误
    * @param {Error} error - 错误对象
    * @param {Object} token - Token 对象
-   * @returns {'disable'|'skip'} 处理结果
+   * @returns {'disable'|'skip'|'retry'} 处理结果
    * @private
    */
   _handleTokenError(error, token) {
     const suffix = token.access_token?.slice(-8) || 'unknown';
-    if (error.statusCode === 403 || error.statusCode === 400) {
+    const statusCode = error.statusCode || error.status;
+
+    // Token invalid - disable it
+    if (statusCode === 403 || statusCode === 400) {
       log.warn(`...${suffix}: Token 已失效或错误，已自动禁用该账号`);
       return 'disable';
     }
+
+    // Rate limiting - should retry later
+    if (statusCode === 429) {
+      log.warn(`...${suffix}: 请求被限流，跳过此 token`);
+      return 'skip';
+    }
+
+    // Server errors (5xx) - temporary issue, can retry
+    if (statusCode >= 500 && statusCode < 600) {
+      log.warn(`...${suffix}: 服务器错误 (${statusCode})，临时跳过`);
+      return 'retry';
+    }
+
+    // Network errors (no status code) - temporary issue
+    if (!statusCode && (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT' || error.code === 'ENOTFOUND')) {
+      log.warn(`...${suffix}: 网络错误 (${error.code})，临时跳过`);
+      return 'retry';
+    }
+
     log.error(`...${suffix} 操作失败:`, error.message);
     return 'skip';
   }
@@ -482,9 +522,11 @@ class TokenManager {
       }
     }
 
-    // 所有可用 token 都不可用，重置额度状态
+    // 所有可用 token 都不可用，重置额度状态并返回 null
+    // 让调用方在下次请求时重新尝试
     this._resetAllQuotas();
-    return this.tokens[0] || null;
+    log.warn('所有 token 在此次请求中都不可用，已重置额度状态');
+    return null;
   }
 
   /**
@@ -530,7 +572,8 @@ class TokenManager {
   }
 
   disableCurrentToken(token) {
-    const found = this.tokens.find(t => t.access_token === token.access_token);
+    // Use refresh_token for lookup since access_token may change after refresh
+    const found = this.tokens.find(t => t.refresh_token === token.refresh_token);
     if (found) {
       this.disableToken(found);
     }

@@ -39,7 +39,13 @@ export function normalizeOpenAIParameters(params = {}) {
   if (params.thinking_budget !== undefined) {
     normalized.thinking_budget = params.thinking_budget;
   } else if (params.reasoning_effort !== undefined) {
-    normalized.thinking_budget = REASONING_EFFORT_MAP[params.reasoning_effort];
+    const mappedBudget = REASONING_EFFORT_MAP[params.reasoning_effort];
+    if (mappedBudget !== undefined) {
+      normalized.thinking_budget = mappedBudget;
+    } else {
+      // Log warning for unrecognized reasoning_effort value
+      console.warn(`[ParameterNormalizer] Unrecognized reasoning_effort value: ${params.reasoning_effort}, using default`);
+    }
   }
 
   return normalized;
