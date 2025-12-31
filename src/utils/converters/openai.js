@@ -2,8 +2,8 @@
 import config from '../../config/config.js';
 import { extractSystemInstruction } from '../utils.js';
 import { convertOpenAIToolsToAntigravity } from '../toolConverter.js';
+import { getCachedSignature } from '../format/signature-cache.js';
 import {
-  getSignatureContext,
   pushUserMessage,
   findFunctionNameById,
   pushFunctionResponse,
@@ -47,12 +47,13 @@ function extractImagesFromContent(content) {
 function handleAssistantMessage(message, antigravityMessages, enableThinking, actualModelName, sessionId) {
   const hasToolCalls = message.tool_calls && message.tool_calls.length > 0;
   const hasContent = message.content && message.content.trim() !== '';
-  const { reasoningSignature, toolSignature } = getSignatureContext(sessionId, actualModelName);
 
   const toolCalls = hasToolCalls
     ? message.tool_calls.map(toolCall => {
       const safeName = processToolName(toolCall.function.name, sessionId, actualModelName);
-      const signature = enableThinking ? (toolCall.thoughtSignature || toolSignature) : null;
+      // 使用按 toolUseId 缓存的签名
+      const cachedSig = getCachedSignature(toolCall.id);
+      const signature = enableThinking ? (toolCall.thoughtSignature || cachedSig || null) : null;
       return createFunctionCallPart(toolCall.id, safeName, toolCall.function.arguments, signature);
     })
     : [];
@@ -63,7 +64,7 @@ function handleAssistantMessage(message, antigravityMessages, enableThinking, ac
       ? message.reasoning_content : ' ';
     parts.push(createThoughtPart(reasoningText));
   }
-  if (hasContent) parts.push({ text: message.content.trimEnd(), thoughtSignature: message.thoughtSignature || reasoningSignature });
+  if (hasContent) parts.push({ text: message.content.trimEnd(), thoughtSignature: message.thoughtSignature || null });
   if (!enableThinking && parts[0]) delete parts[0].thoughtSignature;
 
   pushModelMessage({ parts, toolCalls, hasContent }, antigravityMessages);

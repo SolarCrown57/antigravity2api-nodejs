@@ -2,7 +2,8 @@
 import config from '../../config/config.js';
 import { generateRequestId } from '../idGenerator.js';
 import { convertGeminiToolsToAntigravity } from '../toolConverter.js';
-import { getSignatureContext, createThoughtPart, modelMapping, isEnableThinking } from './common.js';
+import { getCachedSignature } from '../format/signature-cache.js';
+import { createThoughtPart, modelMapping, isEnableThinking } from './common.js';
 import { normalizeGeminiParameters, toGenerationConfig } from '../parameterNormalizer.js';
 
 /**
@@ -50,15 +51,16 @@ function processFunctionCallIds(contents) {
 
 /**
  * 处理 model 消息中的 thought 和签名
+ * 使用按 toolUseId 缓存的签名
  */
-function processModelThoughts(content, reasoningSignature, toolSignature) {
+function processModelThoughts(content) {
   const parts = content.parts;
-  
+
   // 查找 thought 和独立 thoughtSignature 的位置
   let thoughtIndex = -1;
   let signatureIndex = -1;
   let signatureValue = null;
-  
+
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
     if (part.thought === true && !part.thoughtSignature) {
@@ -69,17 +71,17 @@ function processModelThoughts(content, reasoningSignature, toolSignature) {
       signatureValue = part.thoughtSignature;
     }
   }
-  
+
   // 合并或添加 thought 和签名
   if (thoughtIndex !== -1 && signatureIndex !== -1) {
     parts[thoughtIndex].thoughtSignature = signatureValue;
     parts.splice(signatureIndex, 1);
   } else if (thoughtIndex !== -1 && signatureIndex === -1) {
-    parts[thoughtIndex].thoughtSignature = reasoningSignature;
+    // 没有签名，保持原样（不再使用全局签名）
   } else if (thoughtIndex === -1) {
-    parts.unshift(createThoughtPart(' ', reasoningSignature));
+    parts.unshift(createThoughtPart(' '));
   }
-  
+
   // 收集独立的签名 parts（用于 functionCall）
   const standaloneSignatures = [];
   for (let i = parts.length - 1; i >= 0; i--) {
@@ -88,8 +90,8 @@ function processModelThoughts(content, reasoningSignature, toolSignature) {
       standaloneSignatures.unshift({ index: i, signature: part.thoughtSignature });
     }
   }
-  
-  // 为 functionCall 分配签名
+
+  // 为 functionCall 分配签名（优先使用独立签名，其次使用缓存签名）
   let sigIndex = 0;
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
@@ -98,11 +100,15 @@ function processModelThoughts(content, reasoningSignature, toolSignature) {
         part.thoughtSignature = standaloneSignatures[sigIndex].signature;
         sigIndex++;
       } else {
-        part.thoughtSignature = toolSignature;
+        // 尝试从缓存获取签名
+        const cachedSig = getCachedSignature(part.functionCall.id);
+        if (cachedSig) {
+          part.thoughtSignature = cachedSig;
+        }
       }
     }
   }
-  
+
   // 移除已使用的独立签名 parts
   for (let i = standaloneSignatures.length - 1; i >= 0; i--) {
     if (i < sigIndex) {
@@ -120,11 +126,9 @@ export function generateGeminiRequestBody(geminiBody, modelName, token) {
     processFunctionCallIds(request.contents);
 
     if (enableThinking) {
-      const { reasoningSignature, toolSignature } = getSignatureContext(token.sessionId, actualModelName);
-      
       request.contents.forEach(content => {
         if (content.role === 'model' && content.parts && Array.isArray(content.parts)) {
-          processModelThoughts(content, reasoningSignature, toolSignature);
+          processModelThoughts(content);
         }
       });
     }
