@@ -136,6 +136,7 @@ export function generateClaudeRequestBody(claudeMessages, modelName, parameters,
 
     if (mergedSystem) {
         googleRequest.systemInstruction = {
+            role: 'user',
             parts: [{ text: mergedSystem }]
         };
     }
@@ -144,7 +145,7 @@ export function generateClaudeRequestBody(claudeMessages, modelName, parameters,
     if (isClaudeModel && isThinking && claudeTools && claudeTools.length > 0) {
         const hint = 'Interleaved thinking is enabled. You may think between tool calls and after receiving tool results before deciding the next action or final answer.';
         if (!googleRequest.systemInstruction) {
-            googleRequest.systemInstruction = { parts: [{ text: hint }] };
+            googleRequest.systemInstruction = { role: 'user', parts: [{ text: hint }] };
         } else {
             const lastPart = googleRequest.systemInstruction.parts[googleRequest.systemInstruction.parts.length - 1];
             if (lastPart && lastPart.text) {
@@ -195,6 +196,30 @@ export function generateClaudeRequestBody(claudeMessages, modelName, parameters,
     // Filter unsigned thinking blocks for Claude models
     if (isClaudeModel) {
         googleRequest.contents = filterUnsignedThinkingBlocks(googleRequest.contents);
+    }
+
+    // For thinking models, ensure assistant messages start with a thinking block
+    // This is required by the API when thinking is enabled
+    if (isThinking && googleRequest.contents.length > 0) {
+        for (let i = 0; i < googleRequest.contents.length; i++) {
+            const content = googleRequest.contents[i];
+            if (content.role === 'model' && content.parts && content.parts.length > 0) {
+                const firstPart = content.parts[0];
+                // Check if first part is NOT a thinking block
+                const isThinkingBlock = firstPart.thought === true ||
+                    (firstPart.type === 'thinking') ||
+                    (firstPart.type === 'redacted_thinking');
+
+                if (!isThinkingBlock) {
+                    // Insert a placeholder thinking block at the beginning
+                    console.log('[ClaudeConverter] Adding placeholder thinking block for model message at index', i);
+                    content.parts.unshift({
+                        text: ' ',
+                        thought: true
+                    });
+                }
+            }
+        }
     }
 
     // Generation config
