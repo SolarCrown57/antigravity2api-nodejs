@@ -1,4 +1,4 @@
-name: Build Binaries
+name: CreateRelease
 
 on:
   push:
@@ -92,7 +92,7 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.asset_name }}
           retention-days: 30
-          compression-level: 0  # 不再压缩，因为文件已经是压缩包
+          compression-level: 0
 
   release:
     needs: build
@@ -101,6 +101,11 @@ jobs:
       contents: write
     
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 获取所有 tag 用于计数
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -111,32 +116,48 @@ jobs:
           echo "=== Downloaded artifacts ==="
           find artifacts -type f -ls
 
-      - name: Get short SHA
-        id: sha
-        run: echo "short=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+      - name: Generate release tag
+        id: tag
+        run: |
+          DATE=$(date +'%Y%m%d')
+          SHA_SHORT=$(git rev-parse --short HEAD)
+          
+          # 获取今天已有的 release 数量
+          COUNT=$(git tag -l "${DATE}.*" | wc -l)
+          BUILD_NUM=$((COUNT + 1))
+          
+          TAG="${DATE}.${BUILD_NUM}-${SHA_SHORT}"
+          
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "date=$DATE" >> $GITHUB_OUTPUT
+          echo "build_num=$BUILD_NUM" >> $GITHUB_OUTPUT
+          echo "sha=$SHA_SHORT" >> $GITHUB_OUTPUT
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: binary-${{ steps.sha.outputs.short }}
-          name: Binary Build ${{ steps.sha.outputs.short }}
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Build ${{ steps.tag.outputs.tag }}
+          make_latest: ${{ github.ref_name == 'main' || github.ref_name == 'master' }}
+          prerelease: ${{ github.ref_name != 'main' && github.ref_name != 'master' }}
           files: |
             artifacts/**/*.zip
             artifacts/**/*.tar.gz
-          generate_release_notes: false
+          generate_release_notes: true
           body: |
-            自动构建的二进制文件 (实验性)
+            ## 📦 自动构建 - ${{ steps.tag.outputs.tag }}
             
-            分支: `${{ github.ref_name }}`
-            提交: ${{ github.sha }}
+            **日期**: ${{ steps.tag.outputs.date }}
+            **今日构建**: #${{ steps.tag.outputs.build_num }}
+            **提交**: `${{ steps.tag.outputs.sha }}`
+            **分支**: `${{ github.ref_name }}`
             
-            ## 下载
-            - Windows x64: `antigravity-win-x64.zip`
-            - Linux x64: `antigravity-linux-x64.tar.gz`
-            - Linux ARM64 (Termux): `antigravity-linux-arm64.tar.gz`
-            - macOS x64: `antigravity-macos-x64.tar.gz`
-            - macOS ARM64: `antigravity-macos-arm64.tar.gz`
+            ### 下载说明
+            - **Windows x64**: `antigravity-win-x64.zip`
+            - **Linux x64**: `antigravity-linux-x64.tar.gz`
+            - **Linux ARM64** (Termux): `antigravity-linux-arm64.tar.gz`
+            - **macOS x64**: `antigravity-macos-x64.tar.gz`
+            - **macOS ARM64**: `antigravity-macos-arm64.tar.gz`
           draft: false
-          prerelease: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

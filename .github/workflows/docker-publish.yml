@@ -7,7 +7,6 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build:
@@ -17,14 +16,15 @@ jobs:
       packages: write
     
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: linux
             arch: amd64
-            tag_suffix: ""
+            platform: linux/amd64
           - target: linux-arm64
             arch: arm64
-            tag_suffix: "-arm64"
+            platform: linux/arm64
 
     steps:
       - name: Checkout
@@ -44,22 +44,21 @@ jobs:
           if [ ! -f config.json ]; then
             cp config.json.example config.json
           fi
-        shell: bash
 
-      - name: Build binary for ${{ matrix.arch }}
+      - name: Build binary for ${{ matrix.target }}
         run: npm run build:${{ matrix.target }}
 
       - name: List dist contents
         run: |
           echo "=== dist directory contents ==="
           ls -la dist/
-          echo "=== bin directory ==="
-          ls -la dist/bin/ || echo "No bin directory"
 
-      - name: Set executable permissions
-        run: |
-          chmod +x dist/antigravity-* || true
-          chmod +x dist/bin/* || true
+      - name: Set lowercase image name
+        id: image
+        run: echo "name=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -71,23 +70,61 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch,suffix=${{ matrix.tag_suffix }}
-            type=raw,value=binary${{ matrix.tag_suffix }},enable=true
-            type=raw,value=latest${{ matrix.tag_suffix }},enable=${{ github.ref == 'refs/heads/binary-build' }}
+      - name: Generate Docker tags
+        id: tags
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ steps.image.outputs.name }}"
+          BRANCH="${{ github.ref_name }}"
+          ARCH="${{ matrix.arch }}"
+          
+          TAGS="${IMAGE}:${BRANCH}-${ARCH}"
+          
+          if [ "$BRANCH" == "main" ]; then
+            TAGS="${TAGS},${IMAGE}:latest-${ARCH}"
+          fi
+          
+          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
 
-      - name: Build and push (${{ matrix.arch }})
+      - name: Build and push Docker image (${{ matrix.arch }})
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile.binary
+          platforms: ${{ matrix.platform }}
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ${{ steps.tags.outputs.tags }}
+          # 关键：让 buildx 能访问本地文件
+          outputs: type=image,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+  create-manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      packages: write
+    
+    steps:
+      - name: Set lowercase image name
+        id: image
+        run: echo "name=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ steps.image.outputs.name }}"
+          
+          docker buildx imagetools create -t ${IMAGE}:latest \
+            ${IMAGE}:latest-amd64 \
+            ${IMAGE}:latest-arm64
+          
+          docker buildx imagetools create -t ${IMAGE}:main \
+            ${IMAGE}:main-amd64 \
+            ${IMAGE}:main-arm64
