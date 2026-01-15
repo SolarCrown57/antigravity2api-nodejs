@@ -6,6 +6,7 @@
 
 - ✅ OpenAI API 兼容格式
 - ✅ 流式和非流式响应
+- ✅ 结构化 JSON 输出支持（response_format）
 - ✅ 工具调用（Function Calling）支持
 - ✅ 多账号自动轮换（支持多种轮询策略）
 - ✅ Token 自动刷新
@@ -717,6 +718,7 @@ messages = [{role: user, content: 你好}]
 | `top_k` | Top-K 采样 | 50 |
 | `thinking_budget` | 思考预算 (1024-32000) | 1024 |
 | `reasoning_effort` | 思考强度 (`low`/`medium`/`high`) | - |
+| `response_format` | 支持响应格式 (`{ "type": "json_object" }`，仅 Gemini 模型支持) | - |
 
 ### Claude 格式 (`/v1/messages`)
 

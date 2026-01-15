@@ -141,6 +141,7 @@ export function generateGenerationConfig(parameters, enableThinking, actualModel
     top_k: parameters.top_k ?? config.defaults.top_k,
     max_tokens: parameters.max_tokens ?? config.defaults.max_tokens,
     thinking_budget: parameters.thinking_budget,
+    response_format: parameters.response_format,
   };
 
   // 处理 reasoning_effort 到 thinking_budget 的转换

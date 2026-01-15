@@ -33,6 +33,7 @@ export function normalizeOpenAIParameters(params = {}) {
     temperature: params.temperature ?? config.defaults.temperature,
     top_p: params.top_p ?? config.defaults.top_p,
     top_k: params.top_k ?? config.defaults.top_k,
+    response_format: params.response_format,
   };
 
   // 处理思考预算
@@ -171,6 +172,13 @@ export function toGenerationConfig(normalized, enableThinking, actualModelName) 
       thinkingBudget: thinkingBudget
     }
   };
+
+  // 处理 response_format 到 Gemini JSON 模式的映射
+  if (normalized.response_format && normalized.response_format.type === 'json_object') {
+    if (actualModelName && actualModelName.toLowerCase().includes('gemini')) {
+      generationConfig.responseMimeType = "application/json";
+    }
+  }
 
   // Claude 模型在启用思考时不支持 topP
   if (actualEnableThinking && actualModelName && actualModelName.includes('claude')) {
